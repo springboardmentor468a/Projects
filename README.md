@@ -4,7 +4,7 @@
 
 🚀 Features
 
-   Automatic Object Extraction – Uses a pre-trained DeepLabV3+ (ResNet34) model for accurate segmentation.
+   Automatic Object Extraction – Uses a pre-trained DeepLabV3  model for accurate segmentation.
 
    Iteractive Web App – Built with Streamlit, includes live preview and download.
 
