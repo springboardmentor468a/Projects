@@ -1,0 +1,9 @@
+streamlit
+pillow
+numpy
+opencv-python
+torch
+torchvision
+segmentation-models-pytorch
+rembg
+scikit-image
