@@ -2,14 +2,10 @@
 
 **Live App:** 🌐 [https://ai-vision-extract.streamlit.app/](https://ai-vision-extract.streamlit.app/)
 
----
-
 ## 🚀 Overview
 
 **VisionExtract** is an interactive web app that uses **Deep Learning (DeepLabV3)** to automatically extract subjects from images by removing their backgrounds.  
 It offers a smooth, intuitive interface for uploading, masking, comparing, and downloading results — all powered by **Streamlit** and **PyTorch**.
-
----
 
 ## 🎯 Key Features
 
@@ -19,16 +15,12 @@ It offers a smooth, intuitive interface for uploading, masking, comparing, and d
 ✅ **Image Gallery** – View, enlarge, and download all your processed images.  
 ✅ **One-Click Downloads** – Download images individually or all at once in a ZIP file.  
 
----
-
 ## 🖼️ Tech Stack
 
 - **Frontend:** Streamlit  
 - **Model:** PyTorch DeepLabV3 (ResNet50 Backbone)  
 - **Image Handling:** Pillow, NumPy  
 - **Deployment:** Streamlit Cloud  
-
----
 
 ## 📸 App Preview
 
@@ -41,6 +33,6 @@ It offers a smooth, intuitive interface for uploading, masking, comparing, and d
 
 🎯 Try it now:  [https://ai-vision-extract.streamlit.app/](https://ai-vision-extract.streamlit.app/)
 
-
+Developed by Sighakolli Mounica Vaishnavi Shakuntala — an AI & Computer Vision enthusiast passionate about creating interactive and intelligent web applications.
 
 
