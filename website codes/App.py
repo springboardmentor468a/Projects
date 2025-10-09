@@ -11,11 +11,6 @@ from scipy import ndimage as ndi
 import os
 from streamlit_image_comparison import image_comparison
 import base64
-
-# ============================================================================
-# CONFIGURATION
-# ============================================================================
-
 CONFIG = {
     "img_size": (512, 512),
     "model_name": "deeplabv3_resnet50",
@@ -25,7 +20,7 @@ CONFIG = {
     "fg_thresh": 0.3,
 }
 
-# Paths - Updated for deployment
+# Paths 
 DEMO_IMAGE_PATHS = {
     "Demo Image 1": "demo/Orginal.jpg",
     "Demo Image 2": "demo/Extracted.jpg"
@@ -37,8 +32,6 @@ BG_IMAGE_PATHS = {
     "Background 3": "backgrounds/bg3.jpg",
     "Background 4": "backgrounds/bg4.jpg",
 }
-
-# Crop Presets
 CROP_PRESETS = {
     "Freeform": None,
     "Square (1:1)": (1, 1),
@@ -49,8 +42,6 @@ CROP_PRESETS = {
     "Facebook Cover (16:9)": (16, 9),
     "Twitter Post (16:9)": (16, 9),
 }
-
-# Filter Presets
 FILTERS = {
     "None": lambda img: img,
     "Grayscale": lambda img: ImageEnhance.Color(img).enhance(0),
@@ -64,9 +55,6 @@ FILTERS = {
     "Blur": lambda img: img.filter(ImageFilter.GaussianBlur(5)),
 }
 
-# ============================================================================
-# CUSTOM CSS
-# ============================================================================
 CUSTOM_CSS = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
@@ -273,11 +261,6 @@ section[data-testid="stFileUploadDropzone"] {
 footer {visibility: hidden;}
 </style>
 """
-
-# ============================================================================
-# SESSION STATE INITIALIZATION
-# ============================================================================
-
 def init_session_state():
     defaults = {
         'uploaded_images': [],
@@ -313,10 +296,6 @@ def init_session_state():
         if key not in st.session_state:
             st.session_state[key] = value
 
-# ============================================================================
-# FILTER FUNCTIONS
-# ============================================================================
-
 def apply_sepia(img):
     arr = np.array(img)
     sepia_filter = np.array([[0.393, 0.769, 0.189],
@@ -346,10 +325,6 @@ def apply_warm_tone(img):
     arr[:, :, 2] *= 0.9
     arr = np.clip(arr, 0, 255)
     return Image.fromarray(arr.astype(np.uint8))
-
-# ============================================================================
-# MODEL FUNCTIONS
-# ============================================================================
 
 @st.cache_resource
 def get_model(path=CONFIG["model_path"]):
@@ -410,10 +385,6 @@ def predict_mask(_model, img_rgb, device, size):
 
     prob_resized = cv2.resize(prob, (w, h), cv2.INTER_LINEAR)
     return prob_resized
-
-# ============================================================================
-# IMAGE PROCESSING FUNCTIONS
-# ============================================================================
 
 def apply_background(orig_np, mask_bin, mode, bg_path=None, custom_color=None):
     h, w = orig_np.shape[:2]
@@ -518,10 +489,6 @@ def get_download_button(image, format_type, quality, button_text, file_name, key
         use_container_width=True
     )
 
-# ============================================================================
-# HELPER FUNCTIONS
-# ============================================================================
-
 def image_to_base64(img_array):
     img_pil = Image.fromarray(img_array)
     buffered = BytesIO()
@@ -533,10 +500,6 @@ def base64_to_image(img_str):
     img_data = base64.b64decode(img_str)
     img_pil = Image.open(BytesIO(img_data))
     return np.array(img_pil)
-
-# ============================================================================
-# PROJECT MANAGEMENT
-# ============================================================================
 
 def save_project():
     try:
@@ -646,10 +609,6 @@ def delete_project(project_name):
     except Exception as e:
         st.error(f"Error deleting project: {str(e)}")
         return False
-
-# ============================================================================
-# MAIN APP
-# ============================================================================
 
 def main():
     init_session_state()
@@ -858,12 +817,12 @@ def main():
                     st.session_state.current_step = 3
                     st.rerun()
 
-                if st.button("🖼️ Custom Image", key="bg_custom_image", use_container_width=True):
+                if st.button("🖼️ Custom Background", key="bg_custom_image", use_container_width=True):
                     st.session_state.extraction_mode = "Custom Image"
                     st.session_state.current_step = 3
                     st.rerun()
 
-                if st.button("📚 Preset Backgrounds", key="toggle_presets", use_container_width=True):
+                if st.button("🗄️Preset Backgrounds", key="toggle_presets", use_container_width=True):
                     st.session_state.show_bg_presets = not st.session_state.show_bg_presets
                     st.rerun()
 
