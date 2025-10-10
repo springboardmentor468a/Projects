@@ -1,1 +1,1 @@
-Link - https://shrijay-nhfbqqbbljcukrys9hmt8a.streamlit.app/
+Link - https://ai-vission-project-ixbtrxuczqz7xjrype7vif.streamlit.app/
