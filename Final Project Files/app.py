@@ -1,64 +1,46 @@
-import streamlit as st
+import gradio as gr
 import torch
 import numpy as np
 import cv2
 from PIL import Image, ImageFilter, ImageEnhance
 import os
-from segment_anything import sam_model_registry, SamPredictor
 import tempfile
 import base64
-from io import BytesIO
-import time
+import segmentation_models_pytorch as smp
+import torchvision.transforms as T
+import torchvision.transforms.functional as TF
+import random
 
-# 🧩 VERSION CHECK SECTION — added safely before app class
-def show_versions():
-    """Display library versions in Streamlit sidebar"""
-    st.sidebar.markdown("### ⚙️ Library Versions")
-    try:
-        st.sidebar.write(f"Torch: {torch.__version__}")
-    except:
-        st.sidebar.write("Torch: Not installed")
-
-    try:
-        st.sidebar.write(f"OpenCV: {cv2.__version__}")
-    except:
-        st.sidebar.write("OpenCV: Not installed")
-
-    try:
-        import segment_anything
-        st.sidebar.write(f"Segment Anything: {segment_anything.__version__ if hasattr(segment_anything, '__version__') else 'N/A'}")
-    except:
-        st.sidebar.write("Segment Anything: Not installed")
-
-    try:
-        import PIL
-        st.sidebar.write(f"Pillow: {PIL.__version__}")
-    except:
-        st.sidebar.write("Pillow: Not installed")
-
-    try:
-        import numpy
-        st.sidebar.write(f"Numpy: {numpy.__version__}")
-    except:
-        st.sidebar.write("Numpy: Not installed")
-
-    st.sidebar.markdown("---")
-    st.sidebar.info("✅ These are the current library versions in your environment.")
-
-# ✅ Call the version display
-show_versions()
+# Set device for Hugging Face deployment
+device = "cuda" if torch.cuda.is_available() else "cpu"
+print(f"🚀 Using device: {device}")
 
 class VisionExtractApp:
-    def __init__(self, model_path, model_type="vit_b"):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+    def __init__(self, model_path):
+        self.device = device
+        print(f"🚀 Initializing VisionExtract on {self.device}...")
         
-        # Load SAM model with weights_only=True to fix the warning
+        # Load DeepLabV3Plus model
         try:
-            self.model = sam_model_registry[model_type](checkpoint=model_path)
+            self.model = smp.DeepLabV3Plus(
+                encoder_name="resnet101",
+                encoder_weights=None,
+                in_channels=3,
+                classes=1
+            )
+            
+            # Load your trained checkpoint - using relative path for Hugging Face
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+            if "model_state" in checkpoint:
+                self.model.load_state_dict(checkpoint["model_state"])
+            else:
+                self.model.load_state_dict(checkpoint)
+            
             self.model.to(device=self.device)
-            self.predictor = SamPredictor(self.model)
+            self.model.eval()
+            print("✅ DeepLabV3Plus model loaded successfully!")
         except Exception as e:
-            st.error(f"❌ Error loading model: {e}")
+            print(f"❌ Error loading model: {e}")
             raise
         
         # Initialize variables
@@ -66,8 +48,121 @@ class VisionExtractApp:
         self.mask = None
         self.extracted_subject = None
         
+        # Image normalization
+        self.imagenet_mean = [0.485, 0.456, 0.406]
+        self.imagenet_std = [0.229, 0.224, 0.225]
+        self.confidence_threshold = 0.3
+
+    def prepare_image_simple(self, img_pil):
+        """Simple preprocessing that WORKS - same as your training"""
+        w, h = img_pil.size
+        
+        # Pad to square (like in your training)
+        s = max(w, h)
+        pad_w = s - w
+        pad_h = s - h
+        padding = (pad_w // 2, pad_h // 2, pad_w - pad_w // 2, pad_h - pad_h // 2)
+        img_pil = TF.pad(img_pil, padding, fill=0)
+        
+        # Resize to 512x512
+        img_pil = img_pil.resize((512, 512), Image.BILINEAR)
+        
+        # Convert to tensor and normalize
+        tensor = T.ToTensor()(img_pil)
+        tensor = T.Normalize(mean=self.imagenet_mean, std=self.imagenet_std)(tensor)
+        
+        return tensor.unsqueeze(0).to(self.device), padding, (w, h)
+
+    def remove_padding_simple(self, mask_np, padding, original_size):
+        """Remove padding to get back to original dimensions"""
+        pad_left, pad_top, pad_right, pad_bottom = padding
+        h, w = mask_np.shape
+        
+        # Remove padding
+        if pad_top + pad_bottom > 0:
+            mask_np = mask_np[pad_top:h-pad_bottom] if pad_bottom > 0 else mask_np[pad_top:]
+        if pad_left + pad_right > 0:
+            mask_np = mask_np[:, pad_left:w-pad_right] if pad_right > 0 else mask_np[:, pad_left:]
+        
+        # Resize to original size
+        original_w, original_h = original_size
+        mask_original = Image.fromarray(mask_np)
+        mask_original = mask_original.resize((original_w, original_h), Image.NEAREST)
+        
+        return np.array(mask_original)
+
+    def clean_mask_smart(self, mask_np, min_area_ratio=0.005):
+        """Smart mask cleaning - keep main object only"""
+        if mask_np.sum() == 0:
+            return mask_np
+        
+        # Find connected components
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_np.astype(np.uint8), connectivity=8)
+        
+        if num_labels <= 1:
+            return mask_np
+        
+        # Calculate minimum area
+        total_pixels = mask_np.shape[0] * mask_np.shape[1]
+        min_area = total_pixels * min_area_ratio
+        
+        # Keep only components larger than minimum area
+        cleaned = np.zeros_like(mask_np)
+        
+        for i in range(1, num_labels):
+            if stats[i, cv2.CC_STAT_AREA] >= min_area:
+                cleaned[labels == i] = 1
+        
+        # If nothing meets threshold, keep the largest one
+        if cleaned.sum() == 0:
+            largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+            cleaned[labels == largest_label] = 1
+        
+        return cleaned
+
+    def smooth_edges_optimized(self, mask_np):
+        """Optimized edge smoothing - simple but effective"""
+        if mask_np.sum() == 0:
+            return mask_np
+        
+        # Step 1: Light morphological closing to fill small gaps
+        kernel = np.ones((3, 3), np.uint8)
+        closed = cv2.morphologyEx(mask_np, cv2.MORPH_CLOSE, kernel)
+        
+        # Step 2: Gentle Gaussian blur for smooth edges
+        mask_float = closed.astype(np.float32)
+        smoothed = cv2.GaussianBlur(mask_float, (5, 5), 0.8)
+        
+        # Step 3: Re-threshold
+        smoothed_binary = (smoothed > 0.4).astype(np.uint8)
+        
+        return smoothed_binary
+
+    def remove_small_holes(self, mask_np, max_hole_size=500):
+        """Remove small holes in the mask"""
+        if mask_np.sum() == 0:
+            return mask_np
+        
+        # Invert mask to find holes
+        inverted = 1 - mask_np
+        
+        # Find connected components in inverted mask (holes)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(inverted.astype(np.uint8), connectivity=8)
+        
+        if num_labels <= 1:
+            return mask_np
+        
+        # Fill small holes
+        filled_mask = mask_np.copy()
+        
+        for i in range(1, num_labels):  # Skip background
+            if stats[i, cv2.CC_STAT_AREA] <= max_hole_size:
+                filled_mask[labels == i] = 1
+        
+        return filled_mask
+
     def extract_subject(self, image):
-        """Extract subject using SAM with improved accuracy"""
+        """Extract subject using DeepLabV3Plus - MATCHING YOUR NOTEBOOK"""
         if image is None:
             return None, None
             
@@ -75,198 +170,270 @@ class VisionExtractApp:
             # Convert to RGB if needed
             if image.mode != 'RGB':
                 image = image.convert('RGB')
-                
-            image_array = np.array(image)
-            self.predictor.set_image(image_array)
             
-            height, width = image_array.shape[:2]
+            # Store original image
+            self.original_image = np.array(image)
             
-            # IMPROVED: Generate better point prompts for subject detection
-            points = []
-            labels = []
+            # Preprocess (with padding) - USING YOUR WORKING NOTEBOOK CODE
+            tensor, padding, original_size = self.prepare_image_simple(image)
             
-            # Center point (most likely to be on subject)
-            points.append([width // 2, height // 2])
-            labels.append(1)
+            # Predict
+            with torch.no_grad():
+                output = self.model(tensor)
+                pred_mask = torch.sigmoid(output)[0, 0].cpu().numpy()
             
-            # Edge points to capture boundaries
-            edge_points = [
-                [width // 4, height // 4],      # Top-left
-                [3 * width // 4, height // 4],  # Top-right
-                [width // 4, 3 * height // 4],  # Bottom-left
-                [3 * width // 4, 3 * height // 4], # Bottom-right
-                [width // 2, height // 4],      # Top-center
-                [width // 2, 3 * height // 4],  # Bottom-center
-            ]
+            # Apply confidence threshold (lower for better edges)
+            pred_binary = (pred_mask > self.confidence_threshold).astype(np.uint8)
             
-            points.extend(edge_points)
-            labels.extend([1] * len(edge_points))
+            # Remove padding
+            pred_original = self.remove_padding_simple(pred_binary, padding, original_size)
             
-            points = np.array(points)
-            labels = np.array(labels)
+            # OPTIMIZED Post-processing Pipeline (3 simple steps) - FROM YOUR NOTEBOOK
+            # Step 1: Clean mask (remove small noise)
+            cleaned_mask = self.clean_mask_smart(pred_original)
             
-            # Predict multiple masks and choose the best one
-            masks, scores, logits = self.predictor.predict(
-                point_coords=points,
-                point_labels=labels,
-                multimask_output=True,
-            )
+            # Step 2: Fill small holes
+            filled_mask = self.remove_small_holes(cleaned_mask)
             
-            # Choose the mask with highest score
-            best_mask_idx = np.argmax(scores)
-            mask = masks[best_mask_idx]
+            # Step 3: Smooth edges gently
+            final_mask = self.smooth_edges_optimized(filled_mask)
             
-            # IMPROVED: Better mask cleaning
-            mask_uint8 = (mask * 255).astype(np.uint8)
+            # Store the final mask
+            self.mask = final_mask.astype(bool)
             
-            # Remove small noise
-            kernel_open = np.ones((3, 3), np.uint8)
-            cleaned_mask = cv2.morphologyEx(mask_uint8, cv2.MORPH_OPEN, kernel_open)
+            # Extract subject - SIMPLE AND RELIABLE APPROACH
+            extracted_subject = self.original_image.copy()
             
-            # Fill holes and smooth edges
-            kernel_close = np.ones((11, 11), np.uint8)
-            cleaned_mask = cv2.morphologyEx(cleaned_mask, cv2.MORPH_CLOSE, kernel_close)
+            # Create proper 3D mask for RGB image
+            mask_3d = self.mask[:, :, np.newaxis]  # Shape: (H, W, 1)
+            extracted_subject = extracted_subject * mask_3d  # Element-wise multiplication
             
-            # Keep only the largest connected component
-            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(cleaned_mask, 8)
-            if num_labels > 1:
-                # Sort by area (skip background at index 0)
-                areas = stats[1:, cv2.CC_STAT_AREA]
-                if len(areas) > 0:
-                    largest_label = np.argmax(areas) + 1
-                    cleaned_mask = (labels == largest_label).astype(np.uint8) * 255
-                else:
-                    cleaned_mask = np.zeros_like(cleaned_mask)
-            
-            # Apply Gaussian blur for smoother edges
-            cleaned_mask = cv2.GaussianBlur(cleaned_mask, (5, 5), 0)
-            _, cleaned_mask = cv2.threshold(cleaned_mask, 128, 255, cv2.THRESH_BINARY)
-            
-            cleaned_mask_bool = cleaned_mask.astype(bool)
-            
-            # Extract subject with the cleaned mask
-            extracted_subject = image_array.copy()
-            extracted_subject[~cleaned_mask_bool] = 0
-            
-            self.original_image = image_array
-            self.mask = cleaned_mask_bool
             self.extracted_subject = extracted_subject
             
-            return Image.fromarray(extracted_subject), cleaned_mask_bool
+            return Image.fromarray(extracted_subject), self.mask
             
         except Exception as e:
-            st.error(f"❌ Error in extraction: {e}")
+            print(f"❌ Error in extraction: {e}")
             return None, None
-    
+
     def apply_background(self, background_mode, custom_color=None, custom_bg_image=None, blur_strength=10):
-        """Apply different background modes"""
+        """Apply different background modes - SIMPLIFIED AND FIXED"""
         if self.original_image is None or self.mask is None:
             return None
             
         try:
+            # Start with original image
             result = self.original_image.copy()
+            
+            # Create proper mask for background replacement
+            background_area = ~self.mask
             
             if background_mode == "Transparent":
                 # Create RGBA image with transparency
                 rgba = np.dstack((self.original_image, self.mask.astype(np.uint8) * 255))
-                return Image.fromarray(rgba)
+                return Image.fromarray(rgba, 'RGBA')
                 
             elif background_mode == "White":
-                result[~self.mask] = [255, 255, 255]
+                result[background_area] = [255, 255, 255]
                 
             elif background_mode == "Black":
-                result[~self.mask] = [0, 0, 0]
+                result[background_area] = [0, 0, 0]
                 
             elif background_mode == "Blur":
-                # Apply Gaussian blur to background
+                # Apply Gaussian blur to background only
                 blurred_bg = cv2.GaussianBlur(self.original_image, (blur_strength*2+1, blur_strength*2+1), 0)
-                result[~self.mask] = blurred_bg[~self.mask]
+                # Replace only the background area with blurred version
+                for c in range(3):  # For each color channel
+                    result_channel = result[:, :, c]
+                    blurred_channel = blurred_bg[:, :, c]
+                    result_channel[background_area] = blurred_channel[background_area]
+                    result[:, :, c] = result_channel
                 
             elif background_mode == "Custom Color" and custom_color:
                 # Convert hex color to RGB
-                color_rgb = tuple(int(custom_color.lstrip('#')[i:i+2], 16) for i in (0, 2, 4))
-                result[~self.mask] = color_rgb
+                if custom_color.startswith('#'):
+                    color_rgb = tuple(int(custom_color[i:i+2], 16) for i in (1, 3, 5))
+                else:
+                    color_rgb = (255, 255, 255)  # Default white
+                # Apply color to background
+                result[background_area] = color_rgb
                 
             elif background_mode == "Custom Image" and custom_bg_image is not None:
                 bg_array = np.array(custom_bg_image)
                 # Resize background to match original image
+                if len(bg_array.shape) == 2:  # Grayscale background
+                    bg_array = cv2.cvtColor(bg_array, cv2.COLOR_GRAY2RGB)
                 bg_resized = cv2.resize(bg_array, (result.shape[1], result.shape[0]))
-                result[~self.mask] = bg_resized[~self.mask]
+                # Replace background
+                result[background_area] = bg_resized[background_area]
             
             return Image.fromarray(result)
             
         except Exception as e:
-            st.error(f"❌ Error applying background: {e}")
+            print(f"❌ Error applying background: {e}")
             return None
-    
-    def apply_filter(self, filter_name):
-        """Apply artistic filters"""
-        if self.original_image is None:
+
+    # ARTISTIC FILTERS FROM YOUR NOTEBOOK
+    def apply_cartoon_effect(self, image_pil):
+        """Apply cartoon effect to image"""
+        img_np = np.array(image_pil)
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        
+        # Apply bilateral filter to smooth while preserving edges
+        smooth = cv2.bilateralFilter(img_np, 9, 75, 75)
+        
+        # Detect edges
+        edges = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
+                                     cv2.THRESH_BINARY, 9, 2)
+        
+        # Convert edges to 3 channels
+        edges_colored = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+        
+        # Combine smooth image with edges
+        cartoon = cv2.bitwise_and(smooth, edges_colored)
+        
+        return Image.fromarray(cartoon)
+
+    def apply_pencil_sketch_effect(self, image_pil):
+        """Apply pencil sketch effect"""
+        img_np = np.array(image_pil)
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(img_np, cv2.COLOR_RGB2GRAY)
+        
+        # Invert the grayscale image
+        inverted = 255 - gray
+        
+        # Apply Gaussian blur
+        blurred = cv2.GaussianBlur(inverted, (21, 21), 0)
+        
+        # Invert the blurred image
+        inverted_blur = 255 - blurred
+        
+        # Create pencil sketch by dividing gray by inverted blur
+        pencil_sketch = cv2.divide(gray, inverted_blur, scale=256.0)
+        
+        # Convert back to 3 channels
+        pencil_sketch_colored = cv2.cvtColor(pencil_sketch, cv2.COLOR_GRAY2RGB)
+        
+        return Image.fromarray(pencil_sketch_colored)
+
+    def apply_sepia_effect(self, image_pil):
+        """Apply sepia tone effect"""
+        img_np = np.array(image_pil)
+        
+        # Sepia filter matrix
+        sepia_filter = np.array([[0.393, 0.769, 0.189],
+                                [0.349, 0.686, 0.168],
+                                [0.272, 0.534, 0.131]])
+        
+        # Apply sepia filter
+        sepia_img = cv2.transform(img_np, sepia_filter)
+        
+        # Clip values to valid range
+        sepia_img = np.clip(sepia_img, 0, 255).astype(np.uint8)
+        
+        return Image.fromarray(sepia_img)
+
+    def apply_hdr_effect(self, image_pil):
+        """Apply HDR-like effect (enhanced contrast and saturation)"""
+        # Enhance contrast
+        contrast_enhancer = ImageEnhance.Contrast(image_pil)
+        enhanced = contrast_enhancer.enhance(1.5)
+        
+        # Enhance color saturation
+        color_enhancer = ImageEnhance.Color(enhanced)
+        enhanced = color_enhancer.enhance(1.3)
+        
+        # Enhance sharpness
+        sharpness_enhancer = ImageEnhance.Sharpness(enhanced)
+        enhanced = sharpness_enhancer.enhance(1.2)
+        
+        return enhanced
+
+    def apply_color_glitch_effect(self, image_pil):
+        """Apply color glitch effect"""
+        img_np = np.array(image_pil)
+        
+        # Split channels
+        r, g, b = img_np[:, :, 0], img_np[:, :, 1], img_np[:, :, 2]
+        
+        # Randomly shift channels
+        shift_x = random.randint(2, 5)
+        shift_y = random.randint(2, 5)
+        
+        # Shift red channel
+        r_shifted = np.roll(r, shift_x, axis=1)
+        r_shifted = np.roll(r_shifted, shift_y, axis=0)
+        
+        # Shift blue channel in opposite direction
+        b_shifted = np.roll(b, -shift_x, axis=1)
+        b_shifted = np.roll(b_shifted, -shift_y, axis=0)
+        
+        # Combine channels
+        glitched = np.stack([r_shifted, g, b_shifted], axis=2)
+        
+        return Image.fromarray(glitched)
+
+    def apply_painting_effect(self, image_pil):
+        """Apply painting-like effect"""
+        img_np = np.array(image_pil)
+        
+        # Apply bilateral filter for oil painting effect
+        painted = cv2.stylization(img_np, sigma_s=60, sigma_r=0.6)
+        
+        return Image.fromarray(painted)
+
+    def apply_filter(self, filter_name, image_to_filter=None):
+        """Apply artistic filters - USING YOUR NOTEBOOK FILTERS"""
+        if image_to_filter is None:
             return None
             
         try:
-            img_pil = Image.fromarray(self.original_image)
-            
             if filter_name == "None":
-                return img_pil
-                
+                return image_to_filter
             elif filter_name == "Cartoon":
-                img_cv = np.array(img_pil)
-                color = cv2.bilateralFilter(img_cv, 9, 300, 300)
-                gray = cv2.cvtColor(img_cv, cv2.COLOR_RGB2GRAY)
-                gray = cv2.medianBlur(gray, 7)
-                edges = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_MEAN_C, 
-                                            cv2.THRESH_BINARY, 9, 2)
-                cartoon = cv2.bitwise_and(color, color, mask=edges)
-                return Image.fromarray(cartoon)
-                
+                return self.apply_cartoon_effect(image_to_filter)
             elif filter_name == "Pencil":
-                img_cv = np.array(img_pil)
-                gray = cv2.cvtColor(img_cv, cv2.COLOR_RGB2GRAY)
-                inverted = 255 - gray
-                blurred = cv2.GaussianBlur(inverted, (21, 21), 0)
-                pencil = cv2.divide(gray, 255 - blurred, scale=256)
-                return Image.fromarray(pencil)
-                
+                return self.apply_pencil_sketch_effect(image_to_filter)
             elif filter_name == "HDR":
-                img_cv = np.array(img_pil)
-                hdr = cv2.detailEnhance(img_cv, sigma_s=12, sigma_r=0.15)
-                return Image.fromarray(hdr)
-                
+                return self.apply_hdr_effect(image_to_filter)
             elif filter_name == "Sepia":
-                img_cv = np.array(img_pil)
-                kernel = np.array([[0.272, 0.534, 0.131],
-                                 [0.349, 0.686, 0.168],
-                                 [0.393, 0.769, 0.189]])
-                sepia = cv2.transform(img_cv, kernel)
-                sepia = np.clip(sepia, 0, 255)
-                return Image.fromarray(sepia.astype(np.uint8))
-                
+                return self.apply_sepia_effect(image_to_filter)
             elif filter_name == "Painting":
-                img_cv = np.array(img_pil)
-                painting = cv2.stylization(img_cv, sigma_s=60, sigma_r=0.6)
-                return Image.fromarray(painting)
-                
+                return self.apply_painting_effect(image_to_filter)
             elif filter_name == "Blur":
-                return img_pil.filter(ImageFilter.GaussianBlur(5))
-                
+                return image_to_filter.filter(ImageFilter.GaussianBlur(5))
             elif filter_name == "Gray":
-                return img_pil.convert('L').convert('RGB')
-                
+                return image_to_filter.convert('L').convert('RGB')
             elif filter_name == "Glitch":
-                img_cv = np.array(img_pil)
-                r, g, b = cv2.split(img_cv)
-                r_shifted = np.roll(r, 5, axis=1)
-                b_shifted = np.roll(b, -5, axis=1)
-                glitched = cv2.merge([r_shifted, g, b_shifted])
-                return Image.fromarray(glitched)
+                return self.apply_color_glitch_effect(image_to_filter)
             
-            return img_pil
+            return image_to_filter
             
         except Exception as e:
-            st.error(f"❌ Error applying filter: {e}")
-            return None
-    
+            print(f"❌ Error applying filter: {e}")
+            return image_to_filter
+
+    def apply_filter_to_subject_only(self, filter_name, extracted_image):
+        """Apply filter only to the subject area - SIMPLIFIED"""
+        if extracted_image is None or self.mask is None:
+            return extracted_image
+            
+        try:
+            # Apply filter to the entire extracted image
+            filtered_img = self.apply_filter(filter_name, extracted_image)
+            if filtered_img is None:
+                return extracted_image
+                
+            return filtered_img
+            
+        except Exception as e:
+            print(f"❌ Error applying filter to subject: {e}")
+            return extracted_image
+
     def crop_image(self, image, aspect_ratio, scale_factor=1.0):
         """Crop image based on aspect ratio"""
         if image is None:
@@ -311,9 +478,9 @@ class VisionExtractApp:
             return Image.fromarray(cropped)
             
         except Exception as e:
-            st.error(f"❌ Error cropping image: {e}")
+            print(f"❌ Error cropping image: {e}")
             return None
-    
+
     def create_comparison(self, final_image):
         """Create side-by-side comparison"""
         if self.original_image is None or final_image is None:
@@ -338,318 +505,379 @@ class VisionExtractApp:
             return comparison
             
         except Exception as e:
-            st.error(f"❌ Error creating comparison: {e}")
+            print(f"❌ Error creating comparison: {e}")
             return None
 
-def get_image_download_link(img, filename, text):
-    """Generate a download link for an image"""
-    buffered = BytesIO()
-    img.save(buffered, format="PNG")
-    img_str = base64.b64encode(buffered.getvalue()).decode()
-    href = f'<a href="data:file/png;base64,{img_str}" download="{filename}" style="background: linear-gradient(135deg, #4ECDC4 0%, #44A08D 100%); color: white; padding: 12px 20px; text-decoration: none; border-radius: 8px; font-weight: 600; display: inline-block; margin: 5px;">{text}</a>'
-    return href
+# Initialize the app with relative path for Hugging Face
+MODEL_PATH = "resumed_best_epoch30.pth"  # Changed to relative path
+app = VisionExtractApp(MODEL_PATH)
 
-def load_demo_collage():
-    """Load demo collage image"""
+# CSS for modern UI
+css = """
+.gradio-container {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    min-height: 100vh;
+}
+.header {
+    text-align: center;
+    padding: 25px;
+    background: linear-gradient(135deg, rgba(102,126,234,0.9) 0%, rgba(118,75,162,0.9) 100%);
+    border-radius: 20px;
+    margin: 15px;
+    backdrop-filter: blur(10px);
+    border: 2px solid rgba(255,255,255,0.3);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+}
+.header h1 {
+    color: white;
+    font-size: 3em;
+    margin: 0;
+    text-shadow: 2px 2px 8px rgba(0,0,0,0.3);
+    font-weight: 700;
+}
+.header p {
+    color: #f0f0f0;
+    font-size: 1.3em;
+    margin: 10px 0 0 0;
+    font-weight: 300;
+}
+.demo-collage {
+    text-align: center;
+    margin: 25px 0;
+    padding: 20px;
+    background: rgba(255,255,255,0.15);
+    border-radius: 20px;
+    backdrop-filter: blur(5px);
+    border: 1px solid rgba(255,255,255,0.2);
+}
+.collage-image {
+    border-radius: 15px;
+    box-shadow: 0 12px 40px rgba(0,0,0,0.4);
+    max-width: 85%;
+    border: 4px solid white;
+    transition: transform 0.3s ease;
+}
+.collage-image:hover {
+    transform: scale(1.02);
+}
+.collage-caption {
+    color: white;
+    font-size: 1.2em;
+    margin-top: 15px;
+    font-weight: 600;
+    text-shadow: 1px 1px 3px rgba(0,0,0,0.3);
+}
+.upload-box {
+    border: 3px dashed rgba(255,255,255,0.7);
+    border-radius: 15px;
+    padding: 30px;
+    text-align: center;
+    background: linear-gradient(135deg, rgba(74,144,226,0.2) 0%, rgba(142,45,226,0.2) 100%);
+    backdrop-filter: blur(5px);
+    transition: all 0.3s ease;
+    margin: 10px 0;
+}
+.upload-box:hover {
+    border-color: rgba(255,255,255,0.9);
+    background: linear-gradient(135deg, rgba(74,144,226,0.3) 0%, rgba(142,45,226,0.3) 100%);
+}
+.upload-box h3 {
+    color: white;
+    font-size: 1.5em;
+    margin: 0 0 10px 0;
+}
+.upload-box p {
+    color: rgba(255,255,255,0.9);
+    margin: 0;
+}
+.section-title {
+    color: white;
+    font-size: 1.4em;
+    font-weight: 600;
+    margin: 20px 0 15px 0;
+    text-shadow: 1px 1px 3px rgba(0,0,0,0.3);
+    padding: 10px 15px;
+    border-radius: 10px;
+    background: rgba(255,255,255,0.15);
+}
+.background-title {
+    background: linear-gradient(135deg, rgba(255,107,107,0.3) 0%, rgba(255,142,83,0.3) 100%);
+    border-left: 4px solid #FF6B6B;
+}
+.filter-title {
+    background: linear-gradient(135deg, rgba(78,205,196,0.3) 0%, rgba(68,160,141,0.3) 100%);
+    border-left: 4px solid #4ECDC4;
+}
+.crop-title {
+    background: linear-gradient(135deg, rgba(158,103,255,0.3) 0%, rgba(255,103,165,0.3) 100%);
+    border-left: 4px solid #9E67FF;
+}
+.option-group {
+    background: rgba(255,255,255,0.12);
+    border-radius: 15px;
+    padding: 20px;
+    margin: 15px 0;
+    backdrop-filter: blur(5px);
+    border: 1px solid rgba(255,255,255,0.2);
+}
+.process-btn {
+    background: linear-gradient(135deg, #FF6B6B 0%, #FF8E53 100%) !important;
+    border: none !important;
+    color: white !important;
+    font-weight: 600 !important;
+    font-size: 1.2em !important;
+    padding: 15px 30px !important;
+    border-radius: 12px !important;
+    transition: all 0.3s ease !important;
+    width: 100%;
+    margin: 20px 0;
+    box-shadow: 0 4px 15px rgba(255,107,107,0.3);
+}
+.process-btn:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 25px rgba(255,107,107,0.4);
+}
+.download-btn {
+    background: linear-gradient(135deg, #4ECDC4 0%, #44A08D 100%) !important;
+    border: none !important;
+    color: white !important;
+    font-weight: 600 !important;
+    border-radius: 10px !important;
+    padding: 12px 20px !important;
+    margin: 5px;
+}
+.results-section {
+    background: rgba(255,255,255,0.12);
+    border-radius: 20px;
+    padding: 25px;
+    margin: 20px 0;
+    backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.2);
+    text-align: center;
+}
+.tab-button {
+    background: rgba(255,255,255,0.15) !important;
+    color: white !important;
+    border: 1px solid rgba(255,255,255,0.3) !important;
+    border-radius: 10px !important;
+    margin: 5px !important;
+    transition: all 0.3s ease !important;
+}
+.tab-button.selected {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%) !important;
+    border: 1px solid rgba(255,255,255,0.5) !important;
+    box-shadow: 0 4px 15px rgba(102,126,234,0.4);
+}
+.main-container {
+    max-width: 1400px !important;
+    margin: 0 auto !important;
+}
+.label-text {
+    color: white !important;
+    font-weight: 600 !important;
+}
+.radio-group .gr-form {
+    background: rgba(255,255,255,0.1) !important;
+    border-radius: 10px !important;
+    padding: 10px !important;
+}
+"""
+
+# Function to encode image to base64
+def image_to_base64(image_path):
+    """Convert image to base64 for embedding"""
     try:
-        demo_path = "https://github.com/rahulasthwik1307/images/blob/master/download.png"
-        if os.path.exists(demo_path):
-            image = Image.open(demo_path)
-            return image
-        else:
-            return None
-    except Exception as e:
-        return None
+        with open(image_path, "rb") as img_file:
+            return base64.b64encode(img_file.read()).decode()
+    except:
+        return ""
 
-def main():
-    # Page configuration
-    st.set_page_config(
-        page_title="VisionExtract - AI Image Editor",
-        page_icon="🎯",
-        layout="wide",
-        initial_sidebar_state="expanded"
+# Create the modern interface
+with gr.Blocks(css=css, theme=gr.themes.Soft()) as demo:
+    
+    gr.HTML("""
+    <div class="main-container">
+        <div class="header">
+            <h1>🎯 VisionExtract</h1>
+            <p>AI-Powered Subject Isolation & Background Replacement</p>
+        </div>
+    """)
+    
+    # Demo collage section
+    with gr.Row():
+        with gr.Column():
+            # Use relative path for Hugging Face deployment
+            try:
+                collage_base64 = image_to_base64("download.png")  # Changed to relative path
+                if collage_base64:
+                    gr.HTML(f"""
+                    <div class="demo-collage">
+                        <h3 style="color: white; text-align: center; margin-bottom: 20px;">✨ See What You Can Create</h3>
+                        <img src="data:image/png;base64,{collage_base64}" class="collage-image" alt="Feature Demo Collage">
+                        <div class="collage-caption">🎭 Background Replacement • 🎨 Artistic Filters • ✂️ Smart Cropping</div>
+                    </div>
+                    """)
+                else:
+                    gr.HTML("""
+                    <div class="demo-collage">
+                        <h3 style="color: white; text-align: center;">✨ AI-Powered Image Editing</h3>
+                        <div class="collage-caption">Upload an image to see the magic! 🎩✨</div>
+                    </div>
+                    """)
+            except:
+                gr.HTML("""
+                <div class="demo-collage">
+                    <h3 style="color: white; text-align: center;">✨ AI-Powered Image Editing</h3>
+                    <div class="collage-caption">Upload an image to see the magic! 🎩✨</div>
+                </div>
+                """)
+    
+    with gr.Row(equal_height=True):
+        with gr.Column(scale=1, min_width=400):
+            # Upload section with colorful styling
+            with gr.Group():
+                gr.HTML("""
+                <div class="upload-box">
+                    <h3>📤 Upload Your Image</h3>
+                    <p>Drag & drop or click to browse • JPG, PNG, JPEG</p>
+                </div>
+                """)
+                input_image = gr.Image(
+                    label="", 
+                    type="pil", 
+                    height=200, 
+                    show_label=False,
+                    sources=["upload"]
+                )
+            
+            # Background Options with colorful header
+            with gr.Group():
+                gr.Markdown("<div class='section-title background-title'>🎭 Background Options</div>")
+                with gr.Group(elem_classes="option-group"):
+                    background_mode = gr.Radio(
+                        choices=["Transparent", "White", "Black", "Blur", "Custom Color", "Custom Image"],
+                        label="Select Background Style",
+                        value="White",
+                        info="Choose how to handle the background"
+                    )
+                    with gr.Row():
+                        custom_color = gr.ColorPicker(label="Custom Color", visible=False)
+                        blur_strength = gr.Slider(1, 20, value=10, label="Blur Strength", visible=False)
+                    custom_bg = gr.Image(
+                        label="Custom Background Image", 
+                        type="pil", 
+                        visible=False, 
+                        height=150,
+                        sources=["upload"]
+                    )
+            
+            # Filters with colorful header
+            with gr.Group():
+                gr.Markdown("<div class='section-title filter-title'>🎨 Artistic Filters</div>")
+                with gr.Group(elem_classes="option-group"):
+                    filter_type = gr.Radio(
+                        choices=["None", "Cartoon", "Pencil", "HDR", "Sepia", "Painting", "Blur", "Gray", "Glitch"],
+                        label="Choose Artistic Filter",
+                        value="None",
+                        info="Apply creative effects to your image"
+                    )
+            
+            # Crop options with colorful header
+            with gr.Group():
+                gr.Markdown("<div class='section-title crop-title'>✂️ Crop & Resize</div>")
+                with gr.Group(elem_classes="option-group"):
+                    aspect_ratio = gr.Radio(
+                        choices=["Free", "Square (1:1)", "Instagram (4:5)", "Portrait (3:4)"],
+                        label="Aspect Ratio",
+                        value="Free",
+                        info="Crop for different platforms"
+                    )
+                    scale_factor = gr.Slider(0.1, 2.0, value=1.0, label="Scale Factor", info="Resize the output image")
+            
+            # Process button
+            process_btn = gr.Button("🚀 Process Image", elem_classes="process-btn", size="lg")
+        
+        with gr.Column(scale=2, min_width=600):
+            # Results area
+            with gr.Group(elem_classes="results-section"):
+                gr.Markdown("<div class='section-title' style='text-align: center; font-size: 1.6em;'>📊 Results & Export</div>")
+                
+                with gr.Tabs() as tabs:
+                    with gr.TabItem("🎯 Extracted Subject", elem_classes="tab-button"):
+                        extracted_output = gr.Image(
+                            label="AI-Extracted Subject",
+                            interactive=False,
+                            height=400,
+                            show_download_button=False
+                        )
+                    
+                    with gr.TabItem("✨ Final Result", elem_classes="tab-button"):
+                        final_output = gr.Image(
+                            label="Final Processed Image", 
+                            interactive=False,
+                            height=400,
+                            show_download_button=False
+                        )
+                    
+                    with gr.TabItem("🔄 Comparison", elem_classes="tab-button"):
+                        comparison_output = gr.Image(
+                            label="Before & After Comparison",
+                            interactive=False, 
+                            height=400,
+                            show_download_button=False
+                        )
+                
+                # Download buttons
+                with gr.Row():
+                    with gr.Column(scale=1):
+                        download_final = gr.DownloadButton(
+                            "📥 Download Final Image", 
+                            visible=False,
+                            elem_classes="download-btn"
+                        )
+                    with gr.Column(scale=1):
+                        download_comparison = gr.DownloadButton(
+                            "📥 Download Comparison", 
+                            visible=False,
+                            elem_classes="download-btn"
+                        )
+    
+    gr.HTML("</div>")  # Close main-container
+    
+    # Show/hide background options based on selection
+    def update_background_visibility(background_mode):
+        return (
+            gr.update(visible=background_mode == "Custom Color"),
+            gr.update(visible=background_mode == "Custom Image"),
+            gr.update(visible=background_mode == "Blur")
+        )
+    
+    background_mode.change(
+        update_background_visibility,
+        inputs=[background_mode],
+        outputs=[custom_color, custom_bg, blur_strength]
     )
     
-    # Custom CSS for modern sleek design
-    st.markdown("""
-    <style>
-    .main-header {
-        font-size: 3.5rem;
-        font-weight: 800;
-        text-align: center;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        margin-bottom: 0.5rem;
-        padding: 1rem;
-    }
-    .sub-header {
-        font-size: 1.4rem;
-        text-align: center;
-        color: #666;
-        margin-bottom: 2rem;
-        font-weight: 300;
-    }
-    .section-title {
-        font-size: 1.2rem;
-        font-weight: 700;
-        color: #333;
-        margin: 1.5rem 0 1rem 0;
-        padding-bottom: 0.5rem;
-        border-bottom: 3px solid #667eea;
-        background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
-        padding: 1rem;
-        border-radius: 10px;
-    }
-    .upload-box {
-        border: 3px dashed #667eea;
-        border-radius: 15px;
-        padding: 2rem;
-        text-align: center;
-        background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%);
-        margin: 1rem 0;
-        transition: all 0.3s ease;
-        min-height: 200px;
-        display: flex;
-        flex-direction: column;
-        justify-content: center;
-        align-items: center;
-    }
-    .upload-box:hover {
-        border-color: #764ba2;
-        background: linear-gradient(135deg, #e9ecef 0%, #dee2e6 100%);
-    }
-    .uploaded-image-container {
-        background: white;
-        border-radius: 15px;
-        padding: 1rem;
-        margin: 1rem 0;
-        border: 2px solid #e9ecef;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-        text-align: center;
-    }
-    .option-group {
-        background: white;
-        border-radius: 15px;
-        padding: 1.5rem;
-        margin: 1rem 0;
-        border: 2px solid #e9ecef;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    }
-    .stButton>button {
-        background: linear-gradient(135deg, #FF6B6B 0%, #FF8E53 100%);
-        color: white;
-        border: none;
-        padding: 1rem 2rem;
-        border-radius: 12px;
-        font-weight: 700;
-        font-size: 1.2rem;
-        width: 100%;
-        transition: all 0.3s ease;
-    }
-    .stButton>button:hover {
-        transform: translateY(-2px);
-        box-shadow: 0 8px 25px rgba(255, 107, 107, 0.4);
-    }
-    .demo-collage {
-        text-align: center;
-        padding: 2rem;
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        border-radius: 20px;
-        margin: 2rem auto;
-        color: white;
-        max-width: 800px;
-    }
-    .demo-image {
-        border-radius: 15px;
-        box-shadow: 0 12px 40px rgba(0,0,0,0.3);
-        max-width: 90%;
-        border: 4px solid white;
-    }
-    .results-section {
-        background: white;
-        border-radius: 20px;
-        padding: 2rem;
-        margin: 2rem 0;
-        border: 2px solid #e9ecef;
-        box-shadow: 0 8px 25px rgba(0, 0, 0, 0.1);
-    }
-    .download-btn {
-        background: linear-gradient(135deg, #4ECDC4 0%, #44A08D 100%);
-        color: white;
-        padding: 12px 20px;
-        border-radius: 8px;
-        font-weight: 600;
-        text-decoration: none;
-        display: inline-block;
-        margin: 5px;
-    }
-    /* Hide Streamlit warnings and info */
-    .stAlert {
-        display: none;
-    }
-    .upload-instructions {
-        text-align: center;
-        color: #666;
-        margin-top: 1rem;
-    }
-    </style>
-    """, unsafe_allow_html=True)
-    
-    # 1. 🎯 HEADER
-    st.markdown('<div class="main-header">🎯 VisionExtract</div>', unsafe_allow_html=True)
-    st.markdown('<div class="sub-header">AI-Powered Subject Isolation & Background Replacement</div>', unsafe_allow_html=True)
-    
-    # Initialize app
-    MODEL_PATH = "https://github.com/rahulasthwik1307/images/blob/master/sam_vit_l_0b3195.pth"
-    
-    if 'app' not in st.session_state:
-        try:
-            st.session_state.app = VisionExtractApp(MODEL_PATH, model_type="vit_l")
-        except:
-            st.error("❌ Failed to load model. Please check the model path.")
-            return
-    
-    app = st.session_state.app
-    
-    # 2. 🖼️ DEMO COLLAGE - CENTERED
-    col_demo = st.columns([1, 3, 1])  # Create 3 columns to center the middle one
-    with col_demo[1]:  # Use the middle column
-        st.markdown('<div class="demo-collage">', unsafe_allow_html=True)
-        st.markdown("### ✨ See What You Can Create")
-        demo_image = load_demo_collage()
-        if demo_image:
-            st.image(demo_image, use_column_width=True, caption="🎭 Background Replacement • 🎨 Artistic Filters • ✂️ Smart Cropping")
-        else:
-            st.info("🌟 Upload an image to experience AI-powered editing magic!")
-        st.markdown('</div>', unsafe_allow_html=True)
-    
-    # Create two columns for layout
-    col1, col2 = st.columns([1, 2])
-    
-    with col1:
-        # 3. 📤 UPLOAD SECTION
-        st.markdown('<div class="section-title">📤 Upload Your Image</div>', unsafe_allow_html=True)
+    # SIMPLIFIED AND RELIABLE PROCESSING FUNCTION
+    def process_and_update(input_image, background_mode, custom_color, custom_bg, blur_strength, 
+                          filter_type, aspect_ratio, scale_factor):
+        # Reset outputs initially
+        extracted, final, comparison = None, None, None
+        final_file, comparison_file = None, None
         
-        # File uploader in the upload box
-        uploaded_file = st.file_uploader(
-            " ",
-            type=['jpg', 'jpeg', 'png'],
-            help="Upload an image to extract the subject",
-            label_visibility="collapsed",
-            key="main_uploader"
-        )
-        
-        # Display upload box or uploaded image
-        if uploaded_file is not None:
-            # Display uploaded image in a nice container
-            input_image = Image.open(uploaded_file)
-            with st.container():
-                st.markdown('<div class="uploaded-image-container">', unsafe_allow_html=True)
-                st.image(input_image, caption="📷 Uploaded Image", use_column_width=True)
-                st.markdown('</div>', unsafe_allow_html=True)
-        else:
-            # Show upload box when no file is uploaded
-            with st.container():
-                st.markdown('<div class="upload-box">', unsafe_allow_html=True)
-                st.markdown("""
-                <div style='text-align: center; color: #666;'>
-                    <h3 style='color: #667eea; margin-bottom: 1rem;'>📤 Upload Your Image</h3>
-                    <p style='font-size: 1.1rem; margin-bottom: 0.5rem;'><strong>Drag & drop or click to browse</strong></p>
-                    <p style='color: #888; font-size: 0.9rem;'>JPG, PNG, JPEG • Limit 200MB per file</p>
-                </div>
-                """, unsafe_allow_html=True)
-                st.markdown('</div>', unsafe_allow_html=True)
-                st.info("👆 Click on the box above to upload an image")
-        
-        # 4. 🎭 BACKGROUND OPTIONS
-        st.markdown('<div class="section-title">🎭 Background Options</div>', unsafe_allow_html=True)
-        with st.container():
-            background_mode = st.selectbox(
-                "Select Background Style",
-                ["White", "Black", "Transparent", "Blur", "Custom Color", "Custom Image"],
-                index=0,
-                help="Choose how to handle the background",
-                label_visibility="collapsed"
-            )
-            
-            custom_color = None
-            custom_bg = None
-            blur_strength = 10
-            
-            if background_mode == "Custom Color":
-                custom_color = st.color_picker("Choose Background Color", "#FF6B6B")
-            elif background_mode == "Custom Image":
-                custom_bg_file = st.file_uploader(
-                    "Upload Background Image",
-                    type=['jpg', 'jpeg', 'png'],
-                    key="bg_upload"
-                )
-                if custom_bg_file is not None:
-                    custom_bg = Image.open(custom_bg_file)
-                    st.image(custom_bg, caption="Custom Background", use_column_width=True)
-            elif background_mode == "Blur":
-                blur_strength = st.slider("Blur Strength", 1, 20, 10, help="Higher values = more blur")
-        
-        # 5. 🎨 FILTERS (Dropdown)
-        st.markdown('<div class="section-title">🎨 Artistic Filters</div>', unsafe_allow_html=True)
-        with st.container():
-            filter_type = st.selectbox(
-                "Choose Artistic Filter",
-                ["None", "Cartoon", "Pencil", "HDR", "Sepia", "Painting", "Blur", "Gray", "Glitch"],
-                index=0,
-                help="Apply creative effects to your image",
-                label_visibility="collapsed"
-            )
-        
-        # 6. ✂️ CROP OPTIONS
-        st.markdown('<div class="section-title">✂️ Crop & Resize</div>', unsafe_allow_html=True)
-        with st.container():
-            aspect_ratio = st.selectbox(
-                "Aspect Ratio",
-                ["Free", "Square (1:1)", "Instagram (4:5)", "Portrait (3:4)"],
-                index=0,
-                help="Crop for different platforms",
-                label_visibility="collapsed"
-            )
-            
-            scale_factor = st.slider("Scale Factor", 0.1, 2.0, 1.0, 0.1, help="Resize the output image")
-        
-        # 7. 🚀 PROCESS BUTTON
-        st.markdown("---")
-        process_clicked = st.button("🚀 Process Image", use_container_width=True, type="primary", 
-                                   disabled=uploaded_file is None)
-    
-    with col2:
-        # 8. 📊 RESULTS AREA
-        if process_clicked and uploaded_file is not None:
-            input_image = Image.open(uploaded_file)
-            with st.spinner("🔄 Processing image with AI... This may take a few seconds"):
+        if input_image is not None:
+            try:
                 # Extract subject
                 extracted, mask = app.extract_subject(input_image)
                 
                 if extracted is not None:
+                    # Apply filter to extracted subject if needed
+                    if filter_type != "None":
+                        extracted = app.apply_filter_to_subject_only(filter_type, extracted)
+                    
                     # Apply background
                     final = app.apply_background(background_mode, custom_color, custom_bg, blur_strength)
-                    
-                    # Apply filter if needed
-                    if filter_type != "None" and final is not None:
-                        filtered = app.apply_filter(filter_type)
-                        if filtered is not None:
-                            # Convert to numpy arrays
-                            filtered_array = np.array(filtered)
-                            final_array = np.array(final)
-                            
-                            # Ensure both arrays have the same shape
-                            if filtered_array.shape == final_array.shape:
-                                # Apply filter only to the subject area
-                                final_array[app.mask] = filtered_array[app.mask]
-                                final = Image.fromarray(final_array)
-                            else:
-                                # If shapes don't match, resize filtered to match final
-                                filtered_resized = np.array(filtered.resize(final_array.shape[1::-1]))
-                                final_array[app.mask] = filtered_resized[app.mask]
-                                final = Image.fromarray(final_array)
                     
                     # Apply cropping
                     if final is not None and aspect_ratio != "Free":
@@ -658,72 +886,44 @@ def main():
                     # Create comparison
                     comparison = app.create_comparison(final)
                     
-                    # Store in session state
-                    st.session_state.extracted_image = extracted
-                    st.session_state.final_image = final
-                    st.session_state.comparison_image = comparison
-                    st.session_state.processed = True
+                    # Prepare download files
+                    if final:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as f:
+                            final.save(f.name, "PNG")
+                            final_file = f.name
                     
-                    st.success("✅ Image processed successfully!")
-                else:
-                    st.error("❌ Failed to extract subject from the image")
+                    if comparison:
+                        with tempfile.NamedTemporaryFile(delete=False, suffix=".png") as f:
+                            comparison.save(f.name, "PNG")
+                            comparison_file = f.name
+                            
+            except Exception as e:
+                print(f"❌ Error in processing pipeline: {e}")
         
-        # Display results
-        if st.session_state.get('processed', False) and st.session_state.final_image is not None:
-            st.markdown('<div class="section-title">📊 Results & Export</div>', unsafe_allow_html=True)
-            
-            # Create tabs for different views
-            tab1, tab2, tab3 = st.tabs(["🎯 Extracted Subject", "✨ Final Result", "🔄 Comparison"])
-            
-            with tab1:
-                if st.session_state.extracted_image is not None:
-                    st.image(st.session_state.extracted_image, caption="AI-Extracted Subject", use_column_width=True)
-                    st.markdown(
-                        get_image_download_link(st.session_state.extracted_image, "extracted_subject.png", "📥 Download Extracted Subject"),
-                        unsafe_allow_html=True
-                    )
-            
-            with tab2:
-                if st.session_state.final_image is not None:
-                    st.image(st.session_state.final_image, caption="Final Processed Image", use_column_width=True)
-                    st.markdown(
-                        get_image_download_link(st.session_state.final_image, "final_image.png", "📥 Download Final Image"),
-                        unsafe_allow_html=True
-                    )
-            
-            with tab3:
-                if st.session_state.comparison_image is not None:
-                    st.image(st.session_state.comparison_image, caption="Before & After Comparison", use_column_width=True)
-                    st.markdown(
-                        get_image_download_link(st.session_state.comparison_image, "comparison.png", "📥 Download Comparison"),
-                        unsafe_allow_html=True
-                    )
-        else:
-            # Placeholder when no processing done
-            if uploaded_file is None:
-                st.markdown("""
-                <div style='text-align: center; padding: 4rem; background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%); border-radius: 15px; border: 2px dashed #667eea;'>
-                    <h3 style='color: #666; margin-bottom: 1rem;'>🎨 Ready to Transform Your Image?</h3>
-                    <p style='color: #888;'>Upload an image on the left and click 'Process Image' to see the magic happen!</p>
-                </div>
-                """, unsafe_allow_html=True)
-            else:
-                st.markdown("""
-                <div style='text-align: center; padding: 4rem; background: linear-gradient(135deg, #f8f9fa 0%, #e9ecef 100%); border-radius: 15px; border: 2px dashed #667eea;'>
-                    <h3 style='color: #666; margin-bottom: 1rem;'>🚀 Ready to Process!</h3>
-                    <p style='color: #888;'>Click the 'Process Image' button on the left to start AI processing.</p>
-                </div>
-                """, unsafe_allow_html=True)
-
-if __name__ == "__main__":
-    # Initialize session state
-    if 'processed' not in st.session_state:
-        st.session_state.processed = False
-    if 'extracted_image' not in st.session_state:
-        st.session_state.extracted_image = None
-    if 'final_image' not in st.session_state:
-        st.session_state.final_image = None
-    if 'comparison_image' not in st.session_state:
-        st.session_state.comparison_image = None
+        return extracted, final, comparison, final_file, comparison_file
     
-    main()
+    # Connect process button
+    process_btn.click(
+        process_and_update,
+        inputs=[input_image, background_mode, custom_color, custom_bg, blur_strength,
+                filter_type, aspect_ratio, scale_factor],
+        outputs=[extracted_output, final_output, comparison_output, 
+                download_final, download_comparison]
+    )
+    
+    # Update download button visibility
+    def update_download_visibility(final, comparison):
+        return (
+            gr.update(visible=final is not None), 
+            gr.update(visible=comparison is not None)
+        )
+    
+    final_output.change(
+        update_download_visibility,
+        inputs=[final_output, comparison_output],
+        outputs=[download_final, download_comparison]
+    )
+
+# Launch the app
+if __name__ == "__main__":
+    demo.launch(share=True, server_port=7860)
