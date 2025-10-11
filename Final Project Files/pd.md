@@ -1,1 +1,1 @@
-https://images-eueyhql6nabjwr2wwkz3qu.streamlit.app/
+https://huggingface.co/spaces/asthwik/iamge_extraction
