@@ -7,7 +7,7 @@ import numpy as np
 import io
 import os
 import random
-
+import gdown 
 # ---------------- Streamlit Page Config ----------------
 st.set_page_config(page_title="Image Segmentation App", layout="wide")
 
@@ -17,8 +17,8 @@ st.markdown("""
     <style>
         /* Main app background */
         .stApp {
-            background-color: linear-gradient(135deg, #B4E50D, #76B900);  
-            color: #FFFFFF;             
+            background: #000000;  /* Solid black background */
+            color: #FFFFFF;
         }
         /* Optional: card-style containers for better contrast */
         .stContainer {
@@ -33,6 +33,15 @@ st.markdown("""
             padding: 10px;
         }
         [data-testid="stSidebar"] * {
+            color: white !important;
+        }
+        /* Force all sidebar text, labels, and controls to white */
+        [data-testid="stSidebar"] label,
+        [data-testid="stSidebar"] span,
+        [data-testid="stSidebar"] div,
+        [data-testid="stSidebar"] input,
+        [data-testid="stSidebar"] select,
+        [data-testid="stSidebar"] textarea {
             color: white !important;
         }
 
@@ -110,11 +119,35 @@ st.title("🎨 AI-Powered Subject Extraction & Background Editor")
 st.markdown('<div class="center-text">Upload your images, try a demo image, or select presets to instantly extract subjects and apply backgrounds.</div>', unsafe_allow_html=True)
 
 # ---------------- Example Before / After ----------------
-before_image_path = r"C:\Users\ASUS\Downloads\download (33).jpg"
-after_image_path = r"C:\Users\ASUS\Downloads\download (33)_black_bg.jpg"  
+# before_image_path = r"C:\Users\ASUS\Downloads\download (33).jpg"
+# after_image_path = r"C:\Users\ASUS\Downloads\download (33)_black_bg.jpg"  
 
-example_before = Image.open(before_image_path).convert("RGB") if os.path.exists(before_image_path) else None
-example_after = Image.open(after_image_path).convert("RGBA") if os.path.exists(after_image_path) else None
+# example_before = Image.open(before_image_path).convert("RGB") if os.path.exists(before_image_path) else None
+# example_after = Image.open(after_image_path).convert("RGBA") if os.path.exists(after_image_path) else None
+
+
+
+# --- Download before/after example images from Google Drive if not present ---
+EX_BEFORE_PATH = "example_before.jpg"
+EX_AFTER_PATH = "example_after.png"
+EX_BEFORE_ID = "1qCxGNto7K-JTbyCrRXRp9MlB-0CcuyVn"
+EX_AFTER_ID = "1LWM2e2cZYo7FqQfebBG6K_bmHuM70fVA"
+
+def download_example_image(file_id, dest):
+    if not os.path.exists(dest):
+        url = f"https://drive.google.com/uc?id={file_id}"
+        with st.spinner(f"Downloading example image: {dest}..."):
+            try:
+                gdown.download(url, dest, quiet=True)
+            except Exception as e:
+                st.warning(f"Could not download {dest}: {e}")
+
+download_example_image(EX_BEFORE_ID, EX_BEFORE_PATH)
+download_example_image(EX_AFTER_ID, EX_AFTER_PATH)
+
+example_before = Image.open(EX_BEFORE_PATH).convert("RGB") if os.path.exists(EX_BEFORE_PATH) else None
+example_after = Image.open(EX_AFTER_PATH).convert("RGBA") if os.path.exists(EX_AFTER_PATH) else None
+
 
 if example_before and example_after:
     # st.subheader("📌 Example Before / After")
@@ -162,16 +195,31 @@ if bg_option == "Custom Color":
 elif bg_option == "Custom Background":
     bg_image_file = st.sidebar.file_uploader("Upload Background Image", type=["png", "jpg","jpeg"])
 
-# ---------------- Preset Backgrounds ----------------
-preset_dir = r"C:\Users\ASUS\Downloads\Preset_Backgrounds"
-preset_files = [f for f in os.listdir(preset_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))] if os.path.exists(preset_dir) else []
+
+# ---------------- Preset Backgrounds (Google Drive Download) ----------------
+PRESET_DIR = "Preset_Backgrounds"
+PRESET_FOLDER_ID = "128tYF4FPqkaHx_4Y2NiPiefDKZF_QIt8"
+
+def download_preset_backgrounds():
+    need_download = not os.path.exists(PRESET_DIR) or not any(f.lower().endswith((".png", ".jpg", ".jpeg")) for f in os.listdir(PRESET_DIR))
+    if need_download:
+        with st.spinner("Downloading preset backgrounds from Google Drive..."):
+            try:
+                gdown.download_folder(f"https://drive.google.com/drive/folders/{PRESET_FOLDER_ID}", output=PRESET_DIR, quiet=True)
+                st.success("Preset backgrounds downloaded successfully!")
+            except Exception as e:
+                st.error(f"Failed to download preset backgrounds: {e}")
+
+download_preset_backgrounds()
+
+preset_files = [f for f in os.listdir(PRESET_DIR) if f.lower().endswith((".png", ".jpg", ".jpeg"))] if os.path.exists(PRESET_DIR) else []
 
 if bg_option == "Preset Backgrounds":
     st.sidebar.write("Select a preset background by clicking a thumbnail:")
     if preset_files:
         cols = st.sidebar.columns(3)
         for idx, file_name in enumerate(preset_files):
-            img_path = os.path.join(preset_dir, file_name)
+            img_path = os.path.join(PRESET_DIR, file_name)
             try:
                 thumb = Image.open(img_path).convert("RGBA").resize((80, 80))
             except:
@@ -179,24 +227,71 @@ if bg_option == "Preset Backgrounds":
             col = cols[idx % 3]
             if col.button("", key=f"preset_btn_{idx}"):
                 st.session_state["selected_preset"] = img_path
-            col.image(thumb, use_column_width=True)
+            col.image(thumb, use_column_width=True, caption=file_name)
+    else:
+        st.sidebar.warning("No preset backgrounds found. Please check your Google Drive folder or try reloading the app.")
 
 if st.session_state["selected_preset"]:
     preset_bg_file = st.session_state["selected_preset"]
 
+
+# ---------------- Google Drive Model Download (Option-A) ----------------
+MODEL_DIR = "model_files"
+MODEL_PATH = os.path.join(MODEL_DIR, "best_model (5).pth")
+
+def download_model(file_id: str, dest: str):
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if not os.path.exists(dest):
+        with st.spinner("Downloading model from Google Drive..."):
+            url = f"https://drive.google.com/uc?id={file_id}"
+            gdown.download(url, dest, quiet=False)
+    else:
+        st.info("Model already downloaded.")
+
+# Get Drive file ID from Streamlit secrets
+# file_id = st.secrets.get("DRIVE_FILE_ID")
+# if not file_id:
+#     st.error("Missing DRIVE_FILE_ID in Streamlit secrets.")
+#     st.stop()
+
+file_id = st.secrets.get("DRIVE_FILE_ID", "1BW7ZpdGILFiDjnvEb0V1S4q7ZBYcwiI8")  # optional fallback
+
+if file_id == "1BW7ZpdGILFiDjnvEb0V1S4q7ZBYcwiI8":
+    st.warning("⚠️ Using default file ID (local test mode). Add DRIVE_FILE_ID in Streamlit secrets for cloud use.")
+
+
+download_model(file_id, MODEL_PATH)
+
+
+
 # ---------------- Load Custom Model ----------------
+# @st.cache_resource
+# def load_model():
+#     model = models.deeplabv3_resnet50(weights=None)
+#     model.classifier[4] = torch.nn.Conv2d(256, 2, kernel_size=1)
+#     model.aux_classifier = None
+#     checkpoint = torch.load(r"C:\Users\ASUS\Downloads\best_model (5).pth", map_location=torch.device("cpu"))
+#     state_dict = {k: v for k, v in checkpoint.items() if k in model.state_dict()}
+#     model.load_state_dict(state_dict, strict=False)
+#     model.eval()
+#     return model
+
+# model = load_model()
+
+
 @st.cache_resource
 def load_model():
     model = models.deeplabv3_resnet50(weights=None)
     model.classifier[4] = torch.nn.Conv2d(256, 2, kernel_size=1)
     model.aux_classifier = None
-    checkpoint = torch.load(r"C:\Users\ASUS\Downloads\best_model (5).pth", map_location=torch.device("cpu"))
+    checkpoint = torch.load(MODEL_PATH, map_location=torch.device("cpu"))
     state_dict = {k: v for k, v in checkpoint.items() if k in model.state_dict()}
     model.load_state_dict(state_dict, strict=False)
     model.eval()
     return model
 
 model = load_model()
+
 
 # ---------------- Preprocessing ----------------
 def preprocess(image):
@@ -286,16 +381,47 @@ else:
     uploaded_files = st.file_uploader("Upload Multiple Images", type=["png","jpg","jpeg"], accept_multiple_files=True)
     uploaded_any = uploaded_files is not None and len(uploaded_files) > 0
 
-# ---------------- Demo Image Section ----------------
-demo_dir = r"C:\Users\ASUS\Downloads\Demo-Image"
-demo_files = [f for f in os.listdir(demo_dir) if f.lower().endswith((".png", ".jpg", ".jpeg"))] if os.path.exists(demo_dir) else []
+ # ---------------- Demo Image Section ----------------
+DEMO_DIR = "Demo-Image"
+DEMO_FOLDER_ID = "1Ibc5YYMM3byWIiKbI3mACzpYbskmgs_L"
+
+def download_demo_images():
+    """Downloads the demo image folder from Google Drive if not present or empty."""
+    need_download = not os.path.exists(DEMO_DIR) or not any(f.lower().endswith((".png", ".jpg", ".jpeg")) for f in os.listdir(DEMO_DIR))
+    if need_download:
+        with st.spinner("Downloading demo images from Google Drive..."):
+            try:
+                gdown.download_folder(f"https://drive.google.com/drive/folders/{DEMO_FOLDER_ID}", output=DEMO_DIR, quiet=True)
+                st.success("Demo images downloaded successfully!")
+            except Exception as e:
+                st.error(f"Failed to download demo images: {e}")
+
+download_demo_images()
+
+demo_files = [f for f in os.listdir(DEMO_DIR) if f.lower().endswith((".png", ".jpg", ".jpeg"))] if os.path.exists(DEMO_DIR) else []
 
 if demo_files:
+    st.markdown("---")
     st.subheader("🚀 Try Demo Image")
-    if st.button("🎯 Try Demo Image"):
+    st.write("Click a thumbnail to select a demo image, or use the random button below.")
+    cols = st.columns(min(4, len(demo_files)))
+    for idx, file_name in enumerate(demo_files):
+        img_path = os.path.join(DEMO_DIR, file_name)
+        try:
+            thumb = Image.open(img_path).convert("RGBA").resize((80, 80))
+        except Exception:
+            continue
+        col = cols[idx % len(cols)]
+        if col.button("", key=f"demo_btn_{idx}", help=file_name):
+            st.session_state["selected_demo"] = img_path
+            uploaded_any = False
+        col.image(thumb, use_column_width=True, caption=file_name)
+    if st.button("🎯 Try Random Demo Image"):
         random_demo = random.choice(demo_files)
-        st.session_state["selected_demo"] = os.path.join(demo_dir, random_demo)
-        uploaded_any = False  # to prioritize demo image
+        st.session_state["selected_demo"] = os.path.join(DEMO_DIR, random_demo)
+        uploaded_any = False
+else:
+    st.warning("No demo images found. Please check your Google Drive folder or try reloading the app.")
 
 # ---------------- Display Demo Image ----------------
 if st.session_state.get("selected_demo") and not uploaded_any:
