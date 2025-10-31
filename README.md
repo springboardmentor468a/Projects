@@ -1,4 +1,4 @@
-[🔷One View link](https://imgseg-ujvhwtyywuhllklkhxnvqv.streamlit.app/)  ← UI design Link
+[🔷One View link](https://mail.google.com/chat/u/0/#chat/home)  ← UI design Link
 
 **AI-Powered Image Background Removal & Processing Application**
 
